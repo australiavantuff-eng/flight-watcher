@@ -1,3 +1,4 @@
 requests
 schedule
 flask
+python-telegram-bot==13.19
