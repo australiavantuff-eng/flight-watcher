@@ -37,9 +37,9 @@ seen_alerts = set()
 # ======================
 # TELEGRAM ALERT
 # ======================
-def send_telegram(message):
+def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured")
+        print("⚠️ Telegram not configured")
         return
 
     payload = {
@@ -47,7 +47,11 @@ def send_telegram(message):
         "text": message,
         "disable_web_page_preview": True
     }
-    requests.post(TG_URL, data=payload, timeout=10)
+
+    try:
+        requests.post(TG_URL, data=payload, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e)
 
 
 # ======================
@@ -55,4 +59,97 @@ def send_telegram(message):
 # ======================
 def search_flights():
     print("🔍 Checking flights...")
-    date_from = datetime.now().strftime("%d/%m_
+
+    date_from = datetime.now().strftime("%d/%m/%Y")
+    date_to = (datetime.now() + timedelta(days=DAYS_AHEAD)).strftime("%d/%m/%Y")
+
+    params = {
+        "fly_from": ORIGIN,
+        "fly_to": DESTINATION,
+        "date_from": date_from,
+        "date_to": date_to,
+        "curr": CURRENCY,
+        "limit": 50,
+        "sort": "price",
+        "one_for_city": 1
+    }
+
+    try:
+        r = requests.get(KIWI_URL, headers=HEADERS, params=params, timeout=15)
+        data = r.json()
+
+        if "data" not in data:
+            print("⚠️ API error or rate limit")
+            return
+
+        for flight in data["data"]:
+            price = flight.get("price")
+            cabin = flight.get("cabin_class", "economy")
+
+            if cabin not in PRICE_THRESHOLD:
+                cabin = "economy"
+
+            if price is None or price > PRICE_THRESHOLD[cabin]:
+                continue
+
+            key = f"{cabin}_{flight['local_departure']}_{price}"
+            if key in seen_alerts:
+                continue
+
+            seen_alerts.add(key)
+            alert(flight, price, cabin)
+
+    except Exception as e:
+        print("❌ Flight search error:", e)
+
+
+# ======================
+# ALERT FORMAT
+# ======================
+def alert(flight, price, cabin):
+    msg = (
+        "🔥 CHEAP FLIGHT ALERT 🔥\n\n"
+        f"Route: {ORIGIN} → {DESTINATION}\n"
+        f"Cabin: {cabin.upper()}\n"
+        f"Price: ${price}\n"
+        f"Departure: {flight['local_departure']}\n\n"
+        f"Book now:\n{flight['deep_link']}"
+    )
+
+    print(msg)
+    send_telegram(msg)
+
+
+# ======================
+# WATCHER THREAD
+# ======================
+def run_watcher():
+    print("✈️ Flight watcher started")
+
+    search_flights()
+    schedule.every(CHECK_EVERY_MINUTES).minutes.do(search_flights)
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+
+# ======================
+# FLASK APP (RENDER NEEDS THIS)
+# ======================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Flight watcher is running 🚀"
+
+
+# ======================
+# ENTRY POINT
+# ======================
+if __name__ == "__main__":
+    watcher_thread = threading.Thread(target=run_watcher, daemon=True)
+    watcher_thread.start()
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
