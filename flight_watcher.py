@@ -1,3 +1,5 @@
+from flask import Flask
+import threading
 import requests
 import schedule
 import time
@@ -121,3 +123,20 @@ schedule.every(CHECK_EVERY_MINUTES).minutes.do(search_flights)
 while True:
     schedule.run_pending()
     time.sleep(1)
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Flight watcher is running 🚀"
+
+def run_watcher():
+    print("✈️ Flight watcher started")
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+if __name__ == "__main__":
+    watcher_thread = threading.Thread(target=run_watcher)
+    watcher_thread.start()
+
+    app.run(host="0.0.0.0", port=8080)
