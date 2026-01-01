@@ -123,6 +123,7 @@ schedule.every(CHECK_EVERY_MINUTES).minutes.do(search_flights)
 while True:
     schedule.run_pending()
     time.sleep(1)
+
 app = Flask(__name__)
 
 @app.route("/")
@@ -136,7 +137,8 @@ def run_watcher():
         time.sleep(1)
 
 if __name__ == "__main__":
-    watcher_thread = threading.Thread(target=run_watcher)
+    watcher_thread = threading.Thread(target=run_watcher, daemon=True)
     watcher_thread.start()
 
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
