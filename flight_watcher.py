@@ -6,12 +6,10 @@ from datetime import datetime, timedelta
 
 import requests
 from flask import Flask
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
-)
+from telegram import Update
 from telegram.ext import (
-    Updater, CommandHandler, CallbackQueryHandler,
-    ConversationHandler, CallbackContext, MessageHandler, Filters
+    Updater, CommandHandler, MessageHandler, Filters,
+    ConversationHandler, CallbackContext
 )
 
 # ======================
@@ -20,32 +18,27 @@ from telegram.ext import (
 AMADEUS_API_KEY = os.getenv("AMADEUS_API_KEY")
 AMADEUS_API_SECRET = os.getenv("AMADEUS_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHECK_EVERY_MINUTES = 3
+CHECK_EVERY_MINUTES = int(os.getenv("CHECK_EVERY_MINUTES", 3))
 
 # ======================
 # CONVERSATION STATES
 # ======================
-(
-    ORIGIN, DESTINATION, DAYS_AHEAD,
-    PRICE_ECONOMY, PRICE_PREMIUM, PRICE_BUSINESS, PRICE_FIRST, CONFIRM
-) = range(8)
+ORIGIN, DESTINATION, DAYS_AHEAD, PRICE_ECONOMY, PRICE_PREMIUM, PRICE_BUSINESS, PRICE_FIRST = range(7)
 
 # ======================
 # ROUTES STORAGE
 # ======================
-user_routes_file = "routes.json"
-seen_alerts_file = "seen_alerts.json"
+ROUTES_FILE = "routes.json"
+SEEN_ALERTS_FILE = "seen_alerts.json"
 
-# Load persisted routes
-if os.path.exists(user_routes_file):
-    with open(user_routes_file, "r") as f:
+if os.path.exists(ROUTES_FILE):
+    with open(ROUTES_FILE, "r") as f:
         user_routes = json.load(f)
 else:
     user_routes = {}
 
-# Load persisted seen alerts
-if os.path.exists(seen_alerts_file):
-    with open(seen_alerts_file, "r") as f:
+if os.path.exists(SEEN_ALERTS_FILE):
+    with open(SEEN_ALERTS_FILE, "r") as f:
         seen_alerts = set(json.load(f))
 else:
     seen_alerts = set()
@@ -64,7 +57,7 @@ def send_telegram(msg, chat_id):
         print("Telegram send error:", e)
 
 # ======================
-# FLIGHT SEARCH FUNCTION
+# FLIGHT SEARCH
 # ======================
 def search_flights_for_route(route):
     origin = route["origin"]
@@ -87,7 +80,7 @@ def search_flights_for_route(route):
     }
 
     try:
-        # NOTE: Replace with real Amadeus API endpoint
+        # TODO: Replace with actual Amadeus flight offers endpoint
         r = requests.get("https://test.api.amadeus.com/v2/shopping/flight-offers",
                          headers=headers, params=params, timeout=15)
         data = r.json()
@@ -106,9 +99,9 @@ def search_flights_for_route(route):
 
             if price <= thresholds[cabin]:
                 seen_alerts.add(key)
-                # Persist seen alerts
-                with open(seen_alerts_file, "w") as f:
+                with open(SEEN_ALERTS_FILE, "w") as f:
                     json.dump(list(seen_alerts), f)
+
                 msg = (
                     f"🔥 CHEAP FLIGHT ALERT 🔥\n\n"
                     f"{origin} → {dest}\n"
@@ -123,7 +116,7 @@ def search_flights_for_route(route):
         print("Flight search error:", e)
 
 # ======================
-# BACKGROUND WATCHER THREAD
+# BACKGROUND WATCHER
 # ======================
 def run_watcher():
     print("✈️ Flight watcher started (background)")
@@ -137,15 +130,15 @@ def run_watcher():
         time.sleep(CHECK_EVERY_MINUTES * 60)
 
 # ======================
-# TELEGRAM BOT HANDLERS
+# TELEGRAM HANDLERS
 # ======================
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Welcome! Let's add a new flight route.\nEnter the origin airport code (e.g., KTM):")
+    update.message.reply_text("Welcome! Enter the origin airport code (e.g., KTM):")
     return ORIGIN
 
 def origin(update: Update, context: CallbackContext):
     context.user_data["origin"] = update.message.text.strip().upper()
-    update.message.reply_text("Enter the destination airport code (e.g., BKK):")
+    update.message.reply_text("Enter destination airport code (e.g., BKK):")
     return DESTINATION
 
 def destination(update: Update, context: CallbackContext):
@@ -184,8 +177,7 @@ def price_first(update: Update, context: CallbackContext):
         "chat_id": update.message.chat_id
     }
     user_routes.setdefault(user_id, []).append(route)
-    # Persist routes
-    with open(user_routes_file, "w") as f:
+    with open(ROUTES_FILE, "w") as f:
         json.dump(user_routes, f, indent=2)
     update.message.reply_text(f"✅ Route {route['origin']} → {route['destination']} added!")
     return ConversationHandler.END
@@ -208,12 +200,12 @@ def status(update: Update, context: CallbackContext):
 def remove(update: Update, context: CallbackContext):
     user_id = str(update.message.from_user.id)
     user_routes[user_id] = []
-    with open(user_routes_file, "w") as f:
+    with open(ROUTES_FILE, "w") as f:
         json.dump(user_routes, f, indent=2)
     update.message.reply_text("All routes removed.")
 
 # ======================
-# FLASK + TELEGRAM INIT
+# FLASK APP
 # ======================
 app = Flask(__name__)
 
@@ -221,6 +213,9 @@ app = Flask(__name__)
 def home():
     return "Flight watcher is running 🚀"
 
+# ======================
+# TELEGRAM BOT INIT
+# ======================
 def start_telegram_bot():
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
@@ -252,7 +247,5 @@ def start_telegram_bot():
 # ======================
 if __name__ == "__main__":
     threading.Thread(target=run_watcher, daemon=True).start()
-    threading.Thread(target=start_telegram_bot, daemon=True).start()
-
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    start_telegram_bot()
