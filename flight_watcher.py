@@ -5,237 +5,247 @@ import json
 from datetime import datetime, timedelta
 
 import requests
-from flask import Flask
-from telegram import Update
-from telegram.ext import (
-    Updater,
-    CommandHandler,
-    ConversationHandler,
-    MessageHandler,
-    Filters,
-    CallbackContext,
+from flask import Flask, request, jsonify
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 )
+from telegram.ext import Dispatcher, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, Filters
 
 # ======================
-# ENV CONFIG
+# CONFIG FROM ENV
 # ======================
 AMADEUS_API_KEY = os.getenv("AMADEUS_API_KEY")
 AMADEUS_API_SECRET = os.getenv("AMADEUS_API_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
-CHECK_EVERY_MINUTES = int(os.getenv("CHECK_EVERY_MINUTES", 30))
-PORT = int(os.getenv("PORT", 10000))
+CHECK_EVERY_MINUTES = 30  # Default 30 min polling
 
 # ======================
-# FILE STORAGE
+# CONVERSATION STATES
 # ======================
-ROUTES_FILE = "routes.json"
-SEEN_FILE = "seen_alerts.json"
+(ORIGIN, DESTINATION, DAYS_AHEAD,
+ PRICE_ECONOMY, PRICE_PREMIUM, PRICE_BUSINESS, PRICE_FIRST, CONFIRM) = range(8)
 
-user_routes = {}
-seen_alerts = set()
+# ======================
+# ROUTES STORAGE
+# ======================
+user_routes_file = "routes.json"
+seen_alerts_file = "seen_alerts.json"
 
-if os.path.exists(ROUTES_FILE):
-    with open(ROUTES_FILE) as f:
+# Load persisted routes
+if os.path.exists(user_routes_file):
+    with open(user_routes_file, "r") as f:
         user_routes = json.load(f)
+else:
+    user_routes = {}
 
-if os.path.exists(SEEN_FILE):
-    with open(SEEN_FILE) as f:
+# Load persisted seen alerts
+if os.path.exists(seen_alerts_file):
+    with open(seen_alerts_file, "r") as f:
         seen_alerts = set(json.load(f))
+else:
+    seen_alerts = set()
 
 # ======================
-# TELEGRAM STATES
+# TELEGRAM ALERT
 # ======================
-(
-    ORIGIN,
-    DESTINATION,
-    DAYS_AHEAD,
-    PRICE_ECONOMY,
-    PRICE_BUSINESS,
-    CONFIRM,
-) = range(6)
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-# ======================
-# TELEGRAM UTIL
-# ======================
-def send_telegram(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
+def send_telegram(msg, chat_id):
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return
     try:
-        requests.post(url, data=payload, timeout=10)
+        bot.send_message(chat_id=chat_id, text=msg, disable_web_page_preview=True)
     except Exception as e:
         print("Telegram send error:", e)
 
 # ======================
-# AMADEUS TOKEN
+# FLIGHT SEARCH FUNCTION
 # ======================
-def get_amadeus_token():
-    r = requests.post(
-        "https://test.api.amadeus.com/v1/security/oauth2/token",
-        data={
-            "grant_type": "client_credentials",
-            "client_id": AMADEUS_API_KEY,
-            "client_secret": AMADEUS_API_SECRET,
-        },
-        timeout=10,
-    )
-    return r.json().get("access_token")
+def search_flights_for_route(route):
+    origin = route["origin"]
+    dest = route["destination"]
+    days_ahead = route["days_ahead"]
+    thresholds = route["thresholds"]
+    chat_id = route["chat_id"]
 
-# ======================
-# FLIGHT SEARCH
-# ======================
-def search_route(route):
-    token = get_amadeus_token()
-    if not token:
-        return
+    date_from = datetime.now().strftime("%Y-%m-%d")
+    date_to = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
-    headers = {"Authorization": f"Bearer {token}"}
-
-    date_from = datetime.utcnow().date()
-    date_to = date_from + timedelta(days=route["days_ahead"])
-
+    headers = {"Authorization": f"Bearer {AMADEUS_API_KEY}"}
     params = {
-        "originLocationCode": route["origin"],
-        "destinationLocationCode": route["destination"],
-        "departureDate": date_from.isoformat(),
+        "originLocationCode": origin,
+        "destinationLocationCode": dest,
+        "departureDate": date_from,
+        "returnDate": date_to,
         "adults": 1,
-        "max": 20,
+        "max": 50
     }
 
-    r = requests.get(
-        "https://test.api.amadeus.com/v2/shopping/flight-offers",
-        headers=headers,
-        params=params,
-        timeout=15,
-    )
+    try:
+        r = requests.get("https://test.api.amadeus.com/v2/shopping/flight-offers",
+                         headers=headers, params=params, timeout=15)
+        data = r.json()
+        flights = data.get("data", [])
 
-    flights = r.json().get("data", [])
+        for flight in flights:
+            price = float(flight.get("price", {}).get("total", 0))
+            cabin = flight.get("travelerPricings", [{}])[0].get(
+                "fareDetailsBySegment", [{}])[0].get("cabin", "economy").lower()
+            if cabin not in thresholds:
+                cabin = "economy"
 
-    for f in flights:
-        price = float(f["price"]["total"])
-        key = f"{route['origin']}-{route['destination']}-{price}"
+            key = f"{origin}_{dest}_{cabin}_{price}_{flight.get('id')}"
+            if key in seen_alerts:
+                continue
 
-        if key in seen_alerts:
-            continue
+            if price <= thresholds[cabin]:
+                seen_alerts.add(key)
+                # Persist seen alerts
+                with open(seen_alerts_file, "w") as f:
+                    json.dump(list(seen_alerts), f)
+                msg = (
+                    f"🔥 CHEAP FLIGHT ALERT 🔥\n\n"
+                    f"{origin} → {dest}\n"
+                    f"Cabin: {cabin.upper()}\n"
+                    f"Price: ${price}\n"
+                    f"Departure: {flight.get('itineraries',[{}])[0].get('segments',[{}])[0].get('departure', {}).get('at')}\n"
+                    f"Book: {flight.get('id','link unavailable')}"
+                )
+                send_telegram(msg, chat_id)
 
-        if price <= route["price"]:
-            seen_alerts.add(key)
-            with open(SEEN_FILE, "w") as sf:
-                json.dump(list(seen_alerts), sf)
-
-            msg = (
-                f"🔥 CHEAP FLIGHT FOUND 🔥\n\n"
-                f"{route['origin']} → {route['destination']}\n"
-                f"Price: ${price}\n"
-                f"Check Amadeus or airline site"
-            )
-            send_telegram(route["chat_id"], msg)
+    except Exception as e:
+        print("Flight search error:", e)
 
 # ======================
-# WATCHER LOOP
+# BACKGROUND WATCHER THREAD
 # ======================
-def watcher():
-    print("✈️ Flight watcher started (optimized)")
+def run_watcher():
+    print("✈️ Flight watcher started (background)")
     while True:
-        for routes in user_routes.values():
-            for route in routes:
-                try:
-                    search_route(route)
-                except Exception as e:
-                    print("Watcher error:", e)
+        try:
+            for user_id, routes in user_routes.items():
+                for route in routes:
+                    search_flights_for_route(route)
+        except Exception as e:
+            print("Watcher thread error:", e)
         time.sleep(CHECK_EVERY_MINUTES * 60)
 
 # ======================
 # TELEGRAM HANDLERS
 # ======================
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Enter ORIGIN airport code (e.g. KTM):")
+def start(update: Update, context):
+    update.message.reply_text("Welcome! Let's add a new flight route.\nEnter the origin airport code (e.g., KTM):")
     return ORIGIN
 
-def origin(update, context):
-    context.user_data["origin"] = update.message.text.upper()
-    update.message.reply_text("Enter DESTINATION airport code (e.g. BKK):")
+def origin(update: Update, context):
+    context.user_data["origin"] = update.message.text.strip().upper()
+    update.message.reply_text("Enter the destination airport code (e.g., BKK):")
     return DESTINATION
 
-def destination(update, context):
-    context.user_data["destination"] = update.message.text.upper()
-    update.message.reply_text("Search how many days ahead? (e.g. 90)")
+def destination(update: Update, context):
+    context.user_data["destination"] = update.message.text.strip().upper()
+    update.message.reply_text("Enter number of days ahead to search (e.g., 90):")
     return DAYS_AHEAD
 
-def days_ahead(update, context):
-    context.user_data["days"] = int(update.message.text)
-    update.message.reply_text("Max price USD?")
+def days_ahead(update: Update, context):
+    context.user_data["days_ahead"] = int(update.message.text.strip())
+    update.message.reply_text("Set max price for Economy (USD):")
     return PRICE_ECONOMY
 
-def price(update, context):
-    chat_id = update.message.chat_id
+def price_economy(update: Update, context):
+    context.user_data.setdefault("thresholds", {})["economy"] = float(update.message.text.strip())
+    update.message.reply_text("Set max price for Premium Economy (USD):")
+    return PRICE_PREMIUM
+
+def price_premium(update: Update, context):
+    context.user_data["thresholds"]["premium_economy"] = float(update.message.text.strip())
+    update.message.reply_text("Set max price for Business (USD):")
+    return PRICE_BUSINESS
+
+def price_business(update: Update, context):
+    context.user_data["thresholds"]["business"] = float(update.message.text.strip())
+    update.message.reply_text("Set max price for First Class (USD):")
+    return PRICE_FIRST
+
+def price_first(update: Update, context):
+    context.user_data["thresholds"]["first"] = float(update.message.text.strip())
+    user_id = str(update.message.from_user.id)
     route = {
         "origin": context.user_data["origin"],
         "destination": context.user_data["destination"],
-        "days_ahead": context.user_data["days"],
-        "price": float(update.message.text),
-        "chat_id": chat_id,
+        "days_ahead": context.user_data["days_ahead"],
+        "thresholds": context.user_data["thresholds"],
+        "chat_id": update.message.chat_id
     }
-
-    user_routes.setdefault(str(chat_id), []).append(route)
-    with open(ROUTES_FILE, "w") as rf:
-        json.dump(user_routes, rf, indent=2)
-
-    update.message.reply_text("✅ Route added and monitoring started")
+    user_routes.setdefault(user_id, []).append(route)
+    # Persist routes
+    with open(user_routes_file, "w") as f:
+        json.dump(user_routes, f, indent=2)
+    update.message.reply_text(f"✅ Route {route['origin']} → {route['destination']} added!")
     return ConversationHandler.END
 
-def status(update, context):
-    routes = user_routes.get(str(update.message.chat_id), [])
-    if not routes:
-        update.message.reply_text("No routes tracked.")
-        return
+def cancel(update: Update, context):
+    update.message.reply_text("❌ Operation cancelled.")
+    return ConversationHandler.END
 
+def status(update: Update, context):
+    user_id = str(update.message.from_user.id)
+    routes = user_routes.get(user_id, [])
+    if not routes:
+        update.message.reply_text("No routes tracked yet.")
+        return
     msg = "Tracked routes:\n"
     for r in routes:
-        msg += f"{r['origin']} → {r['destination']} under ${r['price']}\n"
+        msg += f"{r['origin']} → {r['destination']}, {r['days_ahead']} days ahead, thresholds: {r['thresholds']}\n"
     update.message.reply_text(msg)
 
-def cancel(update, context):
-    update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
+def remove(update: Update, context):
+    user_id = str(update.message.from_user.id)
+    user_routes[user_id] = []
+    with open(user_routes_file, "w") as f:
+        json.dump(user_routes, f, indent=2)
+    update.message.reply_text("All routes removed.")
 
 # ======================
-# TELEGRAM START
-# ======================
-def start_bot():
-    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            ORIGIN: [MessageHandler(Filters.text & ~Filters.command, origin)],
-            DESTINATION: [MessageHandler(Filters.text & ~Filters.command, destination)],
-            DAYS_AHEAD: [MessageHandler(Filters.text & ~Filters.command, days_ahead)],
-            PRICE_ECONOMY: [MessageHandler(Filters.text & ~Filters.command, price)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    dp.add_handler(conv)
-    dp.add_handler(CommandHandler("status", status))
-
-    updater.start_polling()
-    print("🤖 Telegram bot started")
-
-# ======================
-# FLASK APP
+# FLASK APP + WEBHOOK
 # ======================
 app = Flask(__name__)
+dispatcher = Dispatcher(bot, None, use_context=True)
+
+# Register handlers
+conv_handler = ConversationHandler(
+    entry_points=[CommandHandler("start", start)],
+    states={
+        ORIGIN: [MessageHandler(Filters.text & ~Filters.command, origin)],
+        DESTINATION: [MessageHandler(Filters.text & ~Filters.command, destination)],
+        DAYS_AHEAD: [MessageHandler(Filters.text & ~Filters.command, days_ahead)],
+        PRICE_ECONOMY: [MessageHandler(Filters.text & ~Filters.command, price_economy)],
+        PRICE_PREMIUM: [MessageHandler(Filters.text & ~Filters.command, price_premium)],
+        PRICE_BUSINESS: [MessageHandler(Filters.text & ~Filters.command, price_business)],
+        PRICE_FIRST: [MessageHandler(Filters.text & ~Filters.command, price_first)],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+dispatcher.add_handler(conv_handler)
+dispatcher.add_handler(CommandHandler("status", status))
+dispatcher.add_handler(CommandHandler("remove", remove))
+
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "ok", 200
 
 @app.route("/")
 def home():
-    return "Flight watcher running 🚀"
+    return "Flight watcher is running 🚀"
 
 # ======================
-# MAIN
+# ENTRY POINT
 # ======================
 if __name__ == "__main__":
-    threading.Thread(target=watcher, daemon=True).start()
-    threading.Thread(target=start_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    threading.Thread(target=run_watcher, daemon=True).start()
+    # Note: No polling here; Telegram will use webhooks
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
