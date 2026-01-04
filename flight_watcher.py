@@ -120,7 +120,6 @@ def trend(update, context):
 # =========================
 
 def get_amadeus_token():
-    """Fetch Amadeus OAuth token, with error handling."""
     r = requests.post(
         "https://test.api.amadeus.com/v1/security/oauth2/token",
         data={
@@ -219,6 +218,7 @@ def watcher_loop():
         print(f"❌ Failed to get Amadeus token: {e}")
         return
 
+    print("🚀 Watcher loop started")
     while True:
         now = time.time()
 
@@ -228,6 +228,8 @@ def watcher_loop():
                 continue
 
             route["last_check"] = now
+            print(f"🔍 Checking route {route['origin']} → {route['destination']}")
+
             deals = search_flights(route, token)
 
             for dep, ret, price in deals:
@@ -244,6 +246,7 @@ def watcher_loop():
                     f"{recommendation}"
                 )
 
+                print(f"💬 Sending deal: {route['origin']} → {route['destination']} ${price}")
                 bot.send_message(route["chat_id"], msg)
                 route["burst"] = is_burst
 
@@ -262,6 +265,10 @@ def webhook():
 @app.route("/")
 def health():
     return "Flight watcher running", 200
+
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204  # avoid 404 logs for favicon
 
 # =========================
 # MAIN
