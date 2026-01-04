@@ -1,223 +1,213 @@
 import os
 import time
-import json
 import threading
 import requests
 from datetime import datetime, timedelta
-
 from flask import Flask, request
-from telegram import Update, Bot
+from telegram import (
+    Bot,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
 from telegram.ext import (
-    Dispatcher, CommandHandler, MessageHandler,
-    ConversationHandler, Filters, CallbackContext
+    Dispatcher,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    CallbackQueryHandler,
 )
 
-# ======================
-# ENV CONFIG
-# ======================
-AMADEUS_API_KEY = os.getenv("AMADEUS_API_KEY")
-AMADEUS_API_SECRET = os.getenv("AMADEUS_API_SECRET")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# =========================
+# CONFIG
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8016721347:AAEaIPomQvWv4TX98CPhStv0QfkIBUWbsQ8")
+AMADEUS_KEY = os.getenv("AMADEUS_KEY")
+AMADEUS_SECRET = os.getenv("AMADEUS_SECRET")
 
-DEFAULT_POLL_MINUTES = 35
-HIGH_FREQ_MINUTES = 5
-DAILY_API_LIMIT = 2000
+BASE_POLL_MIN = 30 * 60
+BURST_POLL_MIN = 8 * 60
 
-# ======================
-# TELEGRAM STATES
-# ======================
-(
-    ORIGIN, DESTINATION, DAYS_AHEAD,
-    PRICE_ECONOMY, PRICE_PREMIUM, PRICE_BUSINESS, PRICE_FIRST
-) = range(7)
+app = Flask(__name__)
+bot = Bot(BOT_TOKEN)
+dispatcher = Dispatcher(bot, None, workers=1, use_context=True)
 
-# ======================
-# STORAGE
-# ======================
-ROUTES_FILE = "routes.json"
-ALERTS_FILE = "seen_alerts.json"
+# =========================
+# STATE
+# =========================
+user_state = {}
+routes = []
+price_cache = {}
+api_usage = {"calls": 0}
 
-user_routes = json.load(open(ROUTES_FILE)) if os.path.exists(ROUTES_FILE) else {}
-seen_alerts = set(json.load(open(ALERTS_FILE))) if os.path.exists(ALERTS_FILE) else set()
-api_usage = {}
+# =========================
+# TELEGRAM HANDLERS
+# =========================
 
-# ======================
-# AMADEUS TOKEN HANDLING
-# ======================
-amadeus_token = None
-amadeus_token_expiry = 0
+def start(update, context):
+    keyboard = [
+        [
+            InlineKeyboardButton("One-way", callback_data="oneway"),
+            InlineKeyboardButton("Round-trip", callback_data="roundtrip")
+        ]
+    ]
+    update.message.reply_text(
+        "✈️ Choose trip type:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+def trip_type_selected(update, context):
+    query = update.callback_query
+    query.answer()
+    user_state[query.from_user.id] = {"trip_type": query.data}
+    query.message.reply_text("Enter origin airport code (e.g. KTM):")
+
+def handle_text(update, context):
+    uid = update.message.from_user.id
+    text = update.message.text.strip().upper()
+    state = user_state.get(uid, {})
+
+    if "origin" not in state:
+        state["origin"] = text
+        update.message.reply_text("Enter destination airport code:")
+    elif "destination" not in state:
+        state["destination"] = text
+        update.message.reply_text("Enter minimum trip duration (days):")
+    elif "min_days" not in state:
+        state["min_days"] = int(text)
+        update.message.reply_text("Enter maximum trip duration (days):")
+    elif "max_days" not in state:
+        state["max_days"] = int(text)
+        update.message.reply_text("Enter max acceptable price (USD):")
+    else:
+        state["max_price"] = int(text)
+        routes.append({
+            "chat_id": update.message.chat_id,
+            **state,
+            "last_check": 0,
+            "burst": False
+        })
+        user_state.pop(uid)
+        update.message.reply_text("✅ Route added. Watching for deals!")
+
+    user_state[uid] = state
+
+# =========================
+# AMADEUS HELPERS
+# =========================
 
 def get_amadeus_token():
-    global amadeus_token, amadeus_token_expiry
-
-    if amadeus_token and time.time() < amadeus_token_expiry:
-        return amadeus_token
-
-    resp = requests.post(
+    r = requests.post(
         "https://test.api.amadeus.com/v1/security/oauth2/token",
         data={
             "grant_type": "client_credentials",
-            "client_id": AMADEUS_API_KEY,
-            "client_secret": AMADEUS_API_SECRET,
+            "client_id": AMADEUS_KEY,
+            "client_secret": AMADEUS_SECRET,
         },
-        timeout=10,
     )
+    return r.json()["access_token"]
 
-    data = resp.json()
-    amadeus_token = data["access_token"]
-    amadeus_token_expiry = time.time() + data["expires_in"] - 60
-    return amadeus_token
+def search_flights(route, token):
+    deals = []
+    today = datetime.utcnow()
 
-# ======================
-# TELEGRAM SEND
-# ======================
-def send_telegram(chat_id, text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=10)
+    for offset in range(1, 60):
+        dep = today + timedelta(days=offset)
+        for dur in range(route["min_days"], route["max_days"] + 1):
+            ret = dep + timedelta(days=dur)
 
-# ======================
-# FLIGHT SEARCH
-# ======================
-def search_route(route):
-    token = get_amadeus_token()
-    today = datetime.now().strftime("%Y-%m-%d")
+            key = f"{route['origin']}-{route['destination']}-{dep}-{ret}"
+            if key in price_cache:
+                continue
 
-    usage_key = f"{route['chat_id']}_{today}"
-    api_usage[usage_key] = api_usage.get(usage_key, 0) + 1
-    if api_usage[usage_key] > DAILY_API_LIMIT:
-        return
+            params = {
+                "originLocationCode": route["origin"],
+                "destinationLocationCode": route["destination"],
+                "departureDate": dep.strftime("%Y-%m-%d"),
+                "returnDate": ret.strftime("%Y-%m-%d"),
+                "adults": 1,
+                "travelClass": "ECONOMY",
+                "currencyCode": "USD",
+            }
 
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {
-        "originLocationCode": route["origin"],
-        "destinationLocationCode": route["destination"],
-        "departureDate": datetime.now().strftime("%Y-%m-%d"),
-        "adults": 1,
-        "max": 20,
-    }
+            headers = {"Authorization": f"Bearer {token}"}
+            api_usage["calls"] += 1
 
-    r = requests.get(
-        "https://test.api.amadeus.com/v2/shopping/flight-offers",
-        headers=headers,
-        params=params,
-        timeout=15,
-    )
-
-    flights = r.json().get("data", [])
-    cheapest = None
-    triggered = False
-
-    for f in flights:
-        price = float(f["price"]["total"])
-        cheapest = min(cheapest, price) if cheapest else price
-
-        alert_id = f"{route['origin']}_{route['destination']}_{price}"
-        if alert_id in seen_alerts:
-            continue
-
-        if price <= route["thresholds"]["economy"]:
-            send_telegram(
-                route["chat_id"],
-                f"🔥 DEAL FOUND 🔥\n{route['origin']} → {route['destination']}\n💰 ${price}",
+            r = requests.get(
+                "https://test.api.amadeus.com/v2/shopping/flight-offers",
+                params=params,
+                headers=headers,
             )
-            seen_alerts.add(alert_id)
-            triggered = True
 
-    route["last_checked"] = time.time()
-    route["last_price"] = cheapest
-    route["polling_interval"] = HIGH_FREQ_MINUTES if triggered else DEFAULT_POLL_MINUTES
+            if r.status_code != 200:
+                continue
 
-    json.dump(list(seen_alerts), open(ALERTS_FILE, "w"))
+            data = r.json()
+            if not data.get("data"):
+                continue
 
-# ======================
-# ADAPTIVE WATCHER
-# ======================
+            price = float(data["data"][0]["price"]["total"])
+            price_cache[key] = price
+
+            if price <= route["max_price"]:
+                deals.append((dep, ret, price))
+
+    return deals
+
+# =========================
+# WATCH LOOP
+# =========================
+
 def watcher_loop():
-    print("✈️ Adaptive watcher running")
+    token = get_amadeus_token()
+
     while True:
-        for routes in user_routes.values():
-            for route in routes:
-                if time.time() - route.get("last_checked", 0) >= route.get(
-                    "polling_interval", DEFAULT_POLL_MINUTES
-                ) * 60:
-                    search_route(route)
-        time.sleep(60)
+        now = time.time()
 
-# ======================
-# TELEGRAM CONVERSATION
-# ======================
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Enter origin airport code:")
-    return ORIGIN
+        for route in routes:
+            interval = BURST_POLL_MIN if route["burst"] else BASE_POLL_MIN
+            if now - route["last_check"] < interval:
+                continue
 
-def origin(update, context):
-    context.user_data["origin"] = update.message.text.upper()
-    update.message.reply_text("Enter destination airport code:")
-    return DESTINATION
+            route["last_check"] = now
+            deals = search_flights(route, token)
 
-def destination(update, context):
-    context.user_data["destination"] = update.message.text.upper()
-    update.message.reply_text("Days ahead to search:")
-    return DAYS_AHEAD
+            for dep, ret, price in deals:
+                msg = (
+                    f"🔥 DEAL FOUND!\n\n"
+                    f"{route['origin']} → {route['destination']}\n"
+                    f"🛫 {dep.date()}  🛬 {ret.date()}\n"
+                    f"💰 ${price}"
+                )
+                bot.send_message(route["chat_id"], msg)
+                route["burst"] = True
 
-def days_ahead(update, context):
-    context.user_data["days_ahead"] = int(update.message.text)
-    update.message.reply_text("Max Economy price:")
-    return PRICE_ECONOMY
+        time.sleep(10)
 
-def price_economy(update, context):
-    context.user_data["thresholds"] = {"economy": float(update.message.text)}
-    user_id = str(update.message.from_user.id)
-
-    route = {
-        "origin": context.user_data["origin"],
-        "destination": context.user_data["destination"],
-        "days_ahead": context.user_data["days_ahead"],
-        "thresholds": context.user_data["thresholds"],
-        "chat_id": update.message.chat_id,
-        "last_checked": 0,
-        "polling_interval": DEFAULT_POLL_MINUTES,
-    }
-
-    user_routes.setdefault(user_id, []).append(route)
-    json.dump(user_routes, open(ROUTES_FILE, "w"), indent=2)
-
-    update.message.reply_text("✅ Route added!")
-    return ConversationHandler.END
-
-# ======================
-# FLASK + WEBHOOK
-# ======================
-app = Flask(__name__)
-bot = Bot(TELEGRAM_BOT_TOKEN)
-dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
-
-dispatcher.add_handler(
-    ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            ORIGIN: [MessageHandler(Filters.text & ~Filters.command, origin)],
-            DESTINATION: [MessageHandler(Filters.text & ~Filters.command, destination)],
-            DAYS_AHEAD: [MessageHandler(Filters.text & ~Filters.command, days_ahead)],
-            PRICE_ECONOMY: [MessageHandler(Filters.text & ~Filters.command, price_economy)],
-        },
-        fallbacks=[],
-    )
-)
-
-@app.route("/", methods=["GET"])
-def health():
-    return "Flight watcher alive"
+# =========================
+# FLASK WEBHOOK
+# =========================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
     dispatcher.process_update(update)
-    return "ok"
+    return "OK"
 
-# ======================
-# ENTRY POINT
-# ======================
+@app.route("/")
+def health():
+    return "Flight watcher running", 200
+
+# =========================
+# MAIN
+# =========================
+
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CallbackQueryHandler(trip_type_selected))
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+
+threading.Thread(target=watcher_loop, daemon=True).start()
+
 if __name__ == "__main__":
-    threading.Thread(target=watcher_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+    print("✈️ Adaptive watcher running")
+    app.run(host="0.0.0.0", port=10000)
