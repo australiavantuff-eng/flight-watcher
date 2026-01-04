@@ -16,7 +16,11 @@ from telegram.ext import (
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("⚠️ TELEGRAM_BOT_TOKEN not set in environment variables")
+
 AMADEUS_KEY = os.getenv("AMADEUS_KEY")
 AMADEUS_SECRET = os.getenv("AMADEUS_SECRET")
 
