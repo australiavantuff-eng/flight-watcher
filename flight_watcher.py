@@ -4,12 +4,7 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from flask import Flask, request
-from telegram import (
-    Bot,
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
-)
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Dispatcher,
     CommandHandler,
@@ -21,12 +16,13 @@ from telegram.ext import (
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8016721347:AAEaIPomQvWv4TX98CPhStv0QfkIBUWbsQ8")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 AMADEUS_KEY = os.getenv("AMADEUS_KEY")
 AMADEUS_SECRET = os.getenv("AMADEUS_SECRET")
 
 BASE_POLL_MIN = 30 * 60
 BURST_POLL_MIN = 8 * 60
+VOLATILITY_THRESHOLD = 0.15  # 15% drop triggers burst
 
 app = Flask(__name__)
 bot = Bot(BOT_TOKEN)
@@ -46,10 +42,8 @@ api_usage = {"calls": 0}
 
 def start(update, context):
     keyboard = [
-        [
-            InlineKeyboardButton("One-way", callback_data="oneway"),
-            InlineKeyboardButton("Round-trip", callback_data="roundtrip")
-        ]
+        [InlineKeyboardButton("One-way", callback_data="oneway"),
+         InlineKeyboardButton("Round-trip", callback_data="roundtrip")]
     ]
     update.message.reply_text(
         "✈️ Choose trip type:",
@@ -92,6 +86,29 @@ def handle_text(update, context):
 
     user_state[uid] = state
 
+def trend(update, context):
+    uid = update.message.from_user.id
+    user_routes = [r for r in routes if r["chat_id"] == uid]
+    if not user_routes:
+        update.message.reply_text("No routes being tracked yet.")
+        return
+
+    msg_lines = []
+    for route in user_routes:
+        key_prefix = f"{route['origin']}-{route['destination']}"
+        prices = [p for k, p in price_cache.items() if k.startswith(key_prefix)]
+        if not prices:
+            msg_lines.append(f"{route['origin']} → {route['destination']}: No price data yet.")
+            continue
+        avg = sum(prices) / len(prices)
+        min_p = min(prices)
+        max_p = max(prices)
+        msg_lines.append(
+            f"{route['origin']} → {route['destination']}:\n"
+            f"Avg: ${avg:.2f}, Min: ${min_p:.2f}, Max: ${max_p:.2f}"
+        )
+    update.message.reply_text("\n\n".join(msg_lines))
+
 # =========================
 # AMADEUS HELPERS
 # =========================
@@ -115,7 +132,6 @@ def search_flights(route, token):
         dep = today + timedelta(days=offset)
         for dur in range(route["min_days"], route["max_days"] + 1):
             ret = dep + timedelta(days=dur)
-
             key = f"{route['origin']}-{route['destination']}-{dep}-{ret}"
             if key in price_cache:
                 continue
@@ -155,6 +171,28 @@ def search_flights(route, token):
     return deals
 
 # =========================
+# VOLATILITY & RECOMMENDATION
+# =========================
+
+def check_volatility(route, price):
+    key_prefix = f"{route['origin']}-{route['destination']}"
+    recent_prices = [p for k, p in price_cache.items() if k.startswith(key_prefix)]
+    if not recent_prices:
+        return False, 0
+    avg_price = sum(recent_prices) / len(recent_prices)
+    change = (avg_price - price) / avg_price
+    is_burst = change >= VOLATILITY_THRESHOLD
+    return is_burst, change
+
+def get_confidence(change):
+    return min(max(change * 100, 0), 100)
+
+def get_recommendation(change):
+    if change >= VOLATILITY_THRESHOLD:
+        return "💡 Book now!"
+    return "⌛ Wait for better deals."
+
+# =========================
 # WATCH LOOP
 # =========================
 
@@ -173,14 +211,21 @@ def watcher_loop():
             deals = search_flights(route, token)
 
             for dep, ret, price in deals:
+                is_burst, change = check_volatility(route, price)
+                confidence = get_confidence(change)
+                recommendation = get_recommendation(change)
+
                 msg = (
                     f"🔥 DEAL FOUND!\n\n"
                     f"{route['origin']} → {route['destination']}\n"
                     f"🛫 {dep.date()}  🛬 {ret.date()}\n"
-                    f"💰 ${price}"
+                    f"💰 ${price}\n"
+                    f"📊 Confidence: {confidence:.0f}%\n"
+                    f"{recommendation}"
                 )
+
                 bot.send_message(route["chat_id"], msg)
-                route["burst"] = True
+                route["burst"] = is_burst
 
         time.sleep(10)
 
@@ -203,6 +248,7 @@ def health():
 # =========================
 
 dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("trend", trend))
 dispatcher.add_handler(CallbackQueryHandler(trip_type_selected))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 
