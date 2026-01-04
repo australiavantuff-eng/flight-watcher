@@ -21,8 +21,10 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("⚠️ TELEGRAM_BOT_TOKEN not set in environment variables")
 
-AMADEUS_KEY = os.getenv("AMADEUS_KEY")
-AMADEUS_SECRET = os.getenv("AMADEUS_SECRET")
+AMADEUS_KEY = os.getenv("AMADEUS_API_KEY")
+AMADEUS_SECRET = os.getenv("AMADEUS_API_SECRET")
+if not AMADEUS_KEY or not AMADEUS_SECRET:
+    raise ValueError("⚠️ Amadeus API credentials not set in environment variables")
 
 BASE_POLL_MIN = 30 * 60
 BURST_POLL_MIN = 8 * 60
@@ -118,6 +120,7 @@ def trend(update, context):
 # =========================
 
 def get_amadeus_token():
+    """Fetch Amadeus OAuth token, with error handling."""
     r = requests.post(
         "https://test.api.amadeus.com/v1/security/oauth2/token",
         data={
@@ -126,7 +129,16 @@ def get_amadeus_token():
             "client_secret": AMADEUS_SECRET,
         },
     )
-    return r.json()["access_token"]
+    try:
+        r.raise_for_status()
+        data = r.json()
+        return data["access_token"]
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ Amadeus HTTP error: {e} - {r.text}")
+        raise
+    except KeyError:
+        print(f"❌ Amadeus response missing access_token: {r.text}")
+        raise ValueError("Amadeus authentication failed")
 
 def search_flights(route, token):
     deals = []
@@ -201,7 +213,11 @@ def get_recommendation(change):
 # =========================
 
 def watcher_loop():
-    token = get_amadeus_token()
+    try:
+        token = get_amadeus_token()
+    except Exception as e:
+        print(f"❌ Failed to get Amadeus token: {e}")
+        return
 
     while True:
         now = time.time()
