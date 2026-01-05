@@ -18,17 +18,22 @@ from telegram.ext import (
 # =========================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("⚠️ TELEGRAM_BOT_TOKEN not set in environment variables")
-
 AMADEUS_KEY = os.getenv("AMADEUS_API_KEY")
 AMADEUS_SECRET = os.getenv("AMADEUS_API_SECRET")
-if not AMADEUS_KEY or not AMADEUS_SECRET:
-    raise ValueError("⚠️ Amadeus API credentials not set in environment variables")
 
-BASE_POLL_MIN = 30 * 60
-BURST_POLL_MIN = 8 * 60
-VOLATILITY_THRESHOLD = 0.15  # 15% drop triggers burst
+BASE_POLL_SEC = 35 * 60
+BURST_POLL_SEC = 8 * 60
+MAX_API_CALLS_PER_CYCLE = 40   # hard safety cap
+VOLATILITY_THRESHOLD = 0.15
+
+AMADEUS_URL = "https://test.api.amadeus.com/v2/shopping/flight-offers"
+
+CABIN_CLASSES = [
+    "ECONOMY",
+    "PREMIUM_ECONOMY",
+    "BUSINESS",
+    "FIRST"
+]
 
 app = Flask(__name__)
 bot = Bot(BOT_TOKEN)
@@ -37,30 +42,31 @@ dispatcher = Dispatcher(bot, None, workers=1, use_context=True)
 # =========================
 # STATE
 # =========================
+
 user_state = {}
 routes = []
 price_cache = {}
 api_usage = {"calls": 0}
 
 # =========================
-# TELEGRAM HANDLERS
+# TELEGRAM FLOW
 # =========================
 
 def start(update, context):
-    keyboard = [
-        [InlineKeyboardButton("One-way", callback_data="oneway"),
-         InlineKeyboardButton("Round-trip", callback_data="roundtrip")]
-    ]
+    kb = [[
+        InlineKeyboardButton("One-way", callback_data="oneway"),
+        InlineKeyboardButton("Round-trip", callback_data="roundtrip")
+    ]]
     update.message.reply_text(
         "✈️ Choose trip type:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(kb)
     )
 
 def trip_type_selected(update, context):
-    query = update.callback_query
-    query.answer()
-    user_state[query.from_user.id] = {"trip_type": query.data}
-    query.message.reply_text("Enter origin airport code (e.g. KTM):")
+    q = update.callback_query
+    q.answer()
+    user_state[q.from_user.id] = {"trip_type": q.data}
+    q.message.reply_text("Enter origin airport code (e.g. KTM):")
 
 def handle_text(update, context):
     uid = update.message.from_user.id
@@ -72,7 +78,12 @@ def handle_text(update, context):
         update.message.reply_text("Enter destination airport code:")
     elif "destination" not in state:
         state["destination"] = text
-        update.message.reply_text("Enter minimum trip duration (days):")
+        if state["trip_type"] == "roundtrip":
+            update.message.reply_text("Enter minimum trip duration (days):")
+        else:
+            state["min_days"] = 0
+            state["max_days"] = 0
+            update.message.reply_text("Enter max acceptable price (USD):")
     elif "min_days" not in state:
         state["min_days"] = int(text)
         update.message.reply_text("Enter maximum trip duration (days):")
@@ -81,42 +92,37 @@ def handle_text(update, context):
         update.message.reply_text("Enter max acceptable price (USD):")
     else:
         state["max_price"] = int(text)
+
+        # Deduplicate routes
+        route_key = (
+            update.message.chat_id,
+            state["origin"],
+            state["destination"],
+            state["trip_type"],
+            state["min_days"],
+            state["max_days"]
+        )
+        for r in routes:
+            if r["key"] == route_key:
+                update.message.reply_text("⚠️ This route is already being tracked.")
+                user_state.pop(uid)
+                return
+
         routes.append({
+            "key": route_key,
             "chat_id": update.message.chat_id,
             **state,
             "last_check": 0,
             "burst": False
         })
+
         user_state.pop(uid)
         update.message.reply_text("✅ Route added. Watching for deals!")
 
     user_state[uid] = state
 
-def trend(update, context):
-    uid = update.message.from_user.id
-    user_routes = [r for r in routes if r["chat_id"] == uid]
-    if not user_routes:
-        update.message.reply_text("No routes being tracked yet.")
-        return
-
-    msg_lines = []
-    for route in user_routes:
-        key_prefix = f"{route['origin']}-{route['destination']}"
-        prices = [p for k, p in price_cache.items() if k.startswith(key_prefix)]
-        if not prices:
-            msg_lines.append(f"{route['origin']} → {route['destination']}: No price data yet.")
-            continue
-        avg = sum(prices) / len(prices)
-        min_p = min(prices)
-        max_p = max(prices)
-        msg_lines.append(
-            f"{route['origin']} → {route['destination']}:\n"
-            f"Avg: ${avg:.2f}, Min: ${min_p:.2f}, Max: ${max_p:.2f}"
-        )
-    update.message.reply_text("\n\n".join(msg_lines))
-
 # =========================
-# AMADEUS HELPERS
+# AMADEUS
 # =========================
 
 def get_amadeus_token():
@@ -128,132 +134,98 @@ def get_amadeus_token():
             "client_secret": AMADEUS_SECRET,
         },
     )
-    try:
-        r.raise_for_status()
-        data = r.json()
-        return data["access_token"]
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ Amadeus HTTP error: {e} - {r.text}")
-        raise
-    except KeyError:
-        print(f"❌ Amadeus response missing access_token: {r.text}")
-        raise ValueError("Amadeus authentication failed")
+    r.raise_for_status()
+    return r.json()["access_token"]
 
 def search_flights(route, token):
     deals = []
+    headers = {"Authorization": f"Bearer {token}"}
     today = datetime.utcnow()
 
-    for offset in range(1, 60):
+    checked = 0
+    for offset in [7, 14, 21, 30]:  # smart sampling
         dep = today + timedelta(days=offset)
-        for dur in range(route["min_days"], route["max_days"] + 1):
-            ret = dep + timedelta(days=dur)
-            key = f"{route['origin']}-{route['destination']}-{dep}-{ret}"
-            if key in price_cache:
-                continue
 
-            params = {
-                "originLocationCode": route["origin"],
-                "destinationLocationCode": route["destination"],
-                "departureDate": dep.strftime("%Y-%m-%d"),
-                "returnDate": ret.strftime("%Y-%m-%d"),
-                "adults": 1,
-                "travelClass": "ECONOMY",
-                "currencyCode": "USD",
-            }
+        durations = [0] if route["trip_type"] == "oneway" else range(route["min_days"], route["max_days"] + 1)
 
-            headers = {"Authorization": f"Bearer {token}"}
-            api_usage["calls"] += 1
+        for dur in durations:
+            ret = dep + timedelta(days=dur) if dur else None
 
-            r = requests.get(
-                "https://test.api.amadeus.com/v2/shopping/flight-offers",
-                params=params,
-                headers=headers,
-            )
+            for cabin in CABIN_CLASSES:
+                if checked >= MAX_API_CALLS_PER_CYCLE:
+                    return deals
 
-            if r.status_code != 200:
-                continue
+                key = f"{route['origin']}-{route['destination']}-{dep.date()}-{ret}-{cabin}"
+                if key in price_cache:
+                    continue
 
-            data = r.json()
-            if not data.get("data"):
-                continue
+                params = {
+                    "originLocationCode": route["origin"],
+                    "destinationLocationCode": route["destination"],
+                    "departureDate": dep.strftime("%Y-%m-%d"),
+                    "adults": 1,
+                    "travelClass": cabin,
+                    "currencyCode": "USD",
+                }
+                if ret:
+                    params["returnDate"] = ret.strftime("%Y-%m-%d")
 
-            price = float(data["data"][0]["price"]["total"])
-            price_cache[key] = price
+                api_usage["calls"] += 1
+                checked += 1
 
-            if price <= route["max_price"]:
-                deals.append((dep, ret, price))
+                r = requests.get(AMADEUS_URL, params=params, headers=headers)
+                if r.status_code != 200:
+                    continue
+
+                data = r.json().get("data", [])
+                if not data:
+                    continue
+
+                price = float(data[0]["price"]["total"])
+                price_cache[key] = price
+
+                if price <= route["max_price"]:
+                    deals.append((dep, ret, price, cabin))
 
     return deals
 
 # =========================
-# VOLATILITY & RECOMMENDATION
-# =========================
-
-def check_volatility(route, price):
-    key_prefix = f"{route['origin']}-{route['destination']}"
-    recent_prices = [p for k, p in price_cache.items() if k.startswith(key_prefix)]
-    if not recent_prices:
-        return False, 0
-    avg_price = sum(recent_prices) / len(recent_prices)
-    change = (avg_price - price) / avg_price
-    is_burst = change >= VOLATILITY_THRESHOLD
-    return is_burst, change
-
-def get_confidence(change):
-    return min(max(change * 100, 0), 100)
-
-def get_recommendation(change):
-    if change >= VOLATILITY_THRESHOLD:
-        return "💡 Book now!"
-    return "⌛ Wait for better deals."
-
-# =========================
-# WATCH LOOP
+# WATCHER LOOP
 # =========================
 
 def watcher_loop():
-    try:
-        token = get_amadeus_token()
-    except Exception as e:
-        print(f"❌ Failed to get Amadeus token: {e}")
-        return
+    token = get_amadeus_token()
+    print("🚀 Adaptive watcher started")
 
-    print("🚀 Watcher loop started")
     while True:
         now = time.time()
-
         for route in routes:
-            interval = BURST_POLL_MIN if route["burst"] else BASE_POLL_MIN
+            interval = BURST_POLL_SEC if route["burst"] else BASE_POLL_SEC
             if now - route["last_check"] < interval:
                 continue
 
             route["last_check"] = now
-            print(f"🔍 Checking route {route['origin']} → {route['destination']}")
-
             deals = search_flights(route, token)
 
-            for dep, ret, price in deals:
-                is_burst, change = check_volatility(route, price)
-                confidence = get_confidence(change)
-                recommendation = get_recommendation(change)
-
+            for dep, ret, price, cabin in deals:
                 msg = (
-                    f"🔥 DEAL FOUND!\n\n"
+                    f"🔥 DEAL FOUND\n\n"
                     f"{route['origin']} → {route['destination']}\n"
-                    f"🛫 {dep.date()}  🛬 {ret.date()}\n"
-                    f"💰 ${price}\n"
-                    f"📊 Confidence: {confidence:.0f}%\n"
-                    f"{recommendation}"
+                    f"🛫 {dep.date()}"
                 )
-
-                print(f"💬 Sending deal: {route['origin']} → {route['destination']} ${price}")
+                if ret:
+                    msg += f"\n🛬 {ret.date()}"
+                msg += (
+                    f"\n💺 {cabin}"
+                    f"\n💰 ${price}"
+                )
                 bot.send_message(route["chat_id"], msg)
-                route["burst"] = is_burst
+                route["burst"] = True
 
         time.sleep(10)
 
 # =========================
-# FLASK WEBHOOK
+# FLASK
 # =========================
 
 @app.route("/webhook", methods=["POST"])
@@ -268,14 +240,13 @@ def health():
 
 @app.route("/favicon.ico")
 def favicon():
-    return "", 204  # avoid 404 logs for favicon
+    return "", 204
 
 # =========================
 # MAIN
 # =========================
 
 dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("trend", trend))
 dispatcher.add_handler(CallbackQueryHandler(trip_type_selected))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
 
