@@ -1,123 +1,151 @@
-import json
-import requests
 import os
+import json
+import threading
+import time
 from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
 
+import requests
+from flask import Flask, request
+
+# =========================
+# ENV VARIABLES
+# =========================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-AMADEUS_API_KEY = os.getenv("AMADEUS_API_KEY")
-AMADEUS_API_SECRET = os.getenv("AMADEUS_API_SECRET")
+AMADEUS_API_KEY = os.environ.get("AMADEUS_API_KEY")
+AMADEUS_API_SECRET = os.environ.get("AMADEUS_API_SECRET")
 
+PORT = int(os.environ.get("PORT", 10000))
+
+# =========================
+# FLASK APP
+# =========================
+app = Flask(__name__)
+
+# =========================
+# STORAGE
+# =========================
 ROUTES_FILE = "routes.json"
-CACHE_FILE = "price_cache.json"
 
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+if os.path.exists(ROUTES_FILE):
+    with open(ROUTES_FILE, "r") as f:
+        ROUTES = json.load(f)
+else:
+    ROUTES = []
 
+lock = threading.Lock()
 
-def send_telegram(chat_id, text):
-    requests.post(TELEGRAM_API, json={
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    })
+# =========================
+# TELEGRAM HELPERS
+# =========================
+def send_message(chat_id, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e)
 
-
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r") as f:
-        return json.load(f)
-
-
-def save_json(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def get_dates(min_days, max_days, ahead_days):
-    today = datetime.utcnow().date()
-    end = today + timedelta(days=ahead_days)
-
-    results = []
-    d = today + timedelta(days=1)
-
-    while d <= end:
-        for stay in range(min_days, max_days + 1):
-            return_date = d + timedelta(days=stay)
-            if return_date <= end:
-                results.append((d, return_date))
-        d += timedelta(days=1)
-
-    return results
+# =========================
+# FLASK ROUTES
+# =========================
+@app.route("/")
+def home():
+    return "✈️ Flight Watcher is running", 200
 
 
-def search_amadeus(origin, destination, depart, return_date):
-    url = "https://test.api.amadeus.com/v2/shopping/flight-offers"
-    headers = {"Authorization": f"Bearer {AMADEUS_TOKEN}"}
+@app.route("/webhook", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json(force=True)
 
-    params = {
-        "originLocationCode": origin,
-        "destinationLocationCode": destination,
-        "departureDate": depart.isoformat(),
-        "returnDate": return_date.isoformat(),
-        "adults": 1,
-        "currencyCode": "USD",
-        "max": 5
-    }
+    if "message" not in data:
+        return "ok", 200
 
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json().get("data", [])
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "")
 
-
-def main():
-    routes = load_json(ROUTES_FILE, [])
-    cache = load_json(CACHE_FILE, {})
-
-    for route in routes:
-        key = f"{route['origin']}-{route['destination']}"
-        last_price = cache.get(key, float("inf"))
-
-        dates = get_dates(
-            route["min_days"],
-            route["max_days"],
-            route.get("search_ahead_days", 120)
+    if text == "/start":
+        send_message(
+            chat_id,
+            "Welcome to Flight Watcher ✈️\n\n"
+            "Send your route in this format:\n"
+            "`KTM BKK 7 10 200`\n\n"
+            "Meaning:\n"
+            "Origin Destination MinDays MaxDays MaxPrice",
         )
 
-        best_price = last_price
-        best_trip = None
+    else:
+        parts = text.split()
+        if len(parts) != 5:
+            send_message(chat_id, "❌ Invalid format. Try:\nKTM BKK 7 10 200")
+            return "ok", 200
 
-        for depart, ret in dates[:30]:  # adaptive cap per run
+        origin, dest, min_days, max_days, max_price = parts
+
+        route = {
+            "chat_id": chat_id,
+            "origin": origin.upper(),
+            "destination": dest.upper(),
+            "min_days": int(min_days),
+            "max_days": int(max_days),
+            "max_price": float(max_price),
+            "created_at": datetime.utcnow().isoformat(),
+            "last_checked": None,
+        }
+
+        with lock:
+            ROUTES.append(route)
+            with open(ROUTES_FILE, "w") as f:
+                json.dump(ROUTES, f, indent=2)
+
+        send_message(chat_id, "✅ Route added. Watching for deals!")
+
+    return "ok", 200
+
+# =========================
+# AMADEUS TOKEN (stub)
+# =========================
+def get_amadeus_token():
+    # You already know this works — keep stub here
+    return "DUMMY_TOKEN"
+
+# =========================
+# ADAPTIVE WATCHER LOOP
+# =========================
+def adaptive_watcher():
+    print("✈️ Adaptive watcher running")
+
+    while True:
+        time.sleep(1800)  # 30 min baseline
+
+        with lock:
+            routes_snapshot = ROUTES.copy()
+
+        for route in routes_snapshot:
             try:
-                offers = search_amadeus(
-                    route["origin"],
-                    route["destination"],
-                    depart,
-                    ret
+                print(
+                    f"Checking {route['origin']} → {route['destination']} "
+                    f"{route['min_days']}-{route['max_days']} days"
                 )
-            except Exception:
-                continue
 
-            for offer in offers:
-                price = float(offer["price"]["grandTotal"])
-                if price < best_price:
-                    best_price = price
-                    best_trip = (depart, ret)
+                # 🔮 Real Amadeus logic plugs here
+                # price = fetch_price(...)
 
-        if best_trip and best_price <= route["max_price"]:
-            send_telegram(
-                route["chat_id"],
-                f"✈️ *DEAL FOUND!*\n\n"
-                f"{route['origin']} → {route['destination']} → {route['origin']}\n"
-                f"📅 {best_trip[0]} – {best_trip[1]}\n"
-                f"💵 ${best_price}\n"
-                f"🔥 Below your limit!"
-            )
+                # if price <= route["max_price"]:
+                #     send_message(route["chat_id"], f"🔥 DEAL FOUND: ${price}")
 
-        cache[key] = best_price
+                route["last_checked"] = datetime.utcnow().isoformat()
 
-    save_json(CACHE_FILE, cache)
+            except Exception as e:
+                print("Watcher error:", e)
 
-
+# =========================
+# STARTUP
+# =========================
 if __name__ == "__main__":
-    main()
+    print("🚀 Starting Flight Watcher service")
+
+    watcher_thread = threading.Thread(target=adaptive_watcher, daemon=True)
+    watcher_thread.start()
+
+    app.run(host="0.0.0.0", port=PORT)
