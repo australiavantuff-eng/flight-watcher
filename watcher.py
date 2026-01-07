@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_TOKEN = os.environ("TELEGRAM_TOKEN")
 AMADEUS_API_KEY = os.getenv("AMADEUS_API_KEY")
 AMADEUS_API_SECRET = os.getenv("AMADEUS_API_SECRET")
 
