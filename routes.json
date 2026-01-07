@@ -1,0 +1,11 @@
+[
+  {
+    "chat_id": 123456789,
+    "origin": "KTM",
+    "destination": "BKK",
+    "min_days": 7,
+    "max_days": 10,
+    "max_price": 200,
+    "search_ahead_days": 120
+  }
+]
