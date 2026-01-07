@@ -2,8 +2,7 @@ import os
 import json
 import threading
 import time
-from datetime import datetime, timedelta
-
+from datetime import datetime
 import requests
 from flask import Flask, request
 
@@ -13,7 +12,6 @@ from flask import Flask, request
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 AMADEUS_API_KEY = os.environ.get("AMADEUS_API_KEY")
 AMADEUS_API_SECRET = os.environ.get("AMADEUS_API_SECRET")
-
 PORT = int(os.environ.get("PORT", 10000))
 
 # =========================
@@ -73,7 +71,6 @@ def telegram_webhook():
             "Meaning:\n"
             "Origin Destination MinDays MaxDays MaxPrice",
         )
-
     else:
         parts = text.split()
         if len(parts) != 5:
@@ -81,7 +78,6 @@ def telegram_webhook():
             return "ok", 200
 
         origin, dest, min_days, max_days, max_price = parts
-
         route = {
             "chat_id": chat_id,
             "origin": origin.upper(),
@@ -106,7 +102,7 @@ def telegram_webhook():
 # AMADEUS TOKEN (stub)
 # =========================
 def get_amadeus_token():
-    # You already know this works — keep stub here
+    # Stub; replace with real token logic
     return "DUMMY_TOKEN"
 
 # =========================
@@ -114,7 +110,6 @@ def get_amadeus_token():
 # =========================
 def adaptive_watcher():
     print("✈️ Adaptive watcher running")
-
     while True:
         time.sleep(1800)  # 30 min baseline
 
@@ -130,7 +125,6 @@ def adaptive_watcher():
 
                 # 🔮 Real Amadeus logic plugs here
                 # price = fetch_price(...)
-
                 # if price <= route["max_price"]:
                 #     send_message(route["chat_id"], f"🔥 DEAL FOUND: ${price}")
 
@@ -145,7 +139,9 @@ def adaptive_watcher():
 if __name__ == "__main__":
     print("🚀 Starting Flight Watcher service")
 
-    watcher_thread = threading.Thread(target=adaptive_watcher, daemon=True)
-    watcher_thread.start()
+    # Only start watcher in main process, not in Gunicorn workers
+    if os.environ.get("GUNICORN_WORKER_ID") is None:
+        watcher_thread = threading.Thread(target=adaptive_watcher, daemon=True)
+        watcher_thread.start()
 
     app.run(host="0.0.0.0", port=PORT)
